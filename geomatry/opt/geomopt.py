@@ -13,9 +13,10 @@ from ..ff.constraints import reduce_coordinates
 from ..opt.implicit_gradient import get_dRa_star_div_dtheta
 
 class GeometryFitting:
-    def __init__(self, ff: baseFF, loss_function: Callable[[FloatTensor, FloatTensor], FloatTensor], fmax: float=1e-4):
+    def __init__(self, ff: baseFF, loss_function: Callable[[FloatTensor, FloatTensor], FloatTensor], max_steps: int=1000, fmax: float=1e-4):
         self.ff = ff
         self.loss_function = loss_function
+        self.max_steps = max_steps
         self.fmax = fmax
 
     def reset_parameters(self, state_dict: Optional[Dict[str, FloatTensor]]=None, **params) -> None:
@@ -45,12 +46,18 @@ class GeometryFitting:
         atoms.calc = NNFFCalculator(self.ff, graph_builder)
         if fixed_atom_indices is not None:
             atoms.set_constraint(FixAtoms(indices=fixed_atom_indices))
-        optimizer = BFGS(atoms, logfile="/dev/null")
-        optimizer.run(steps=1000, fmax=0.001)
+        optimizer = BFGS(atoms)
+        optimizer.run(steps=self.max_steps, fmax=self.fmax)
         ase.io.write("Ra_star_traj.xyz", atoms, append=True)
         return torch.from_numpy(atoms.get_positions()).to(Ra.device, Ra.dtype).requires_grad_(True)
 
-    def _get_loss_and_gradient(self, params: Dict[str, FloatTensor], graph_builder: GRAPH_BUILDER_TYPE, Ra_star_label: FloatTensor, Za: IntTensor, fixed_atom_indices: Optional[Sequence[int]]=None) -> FloatTensor:
+    def _get_loss_and_gradient(self, 
+        params: Dict[str, FloatTensor], 
+        graph_builder: GRAPH_BUILDER_TYPE, 
+        Ra_star_label: FloatTensor, 
+        Za: IntTensor, 
+        fixed_atom_indices: Optional[Sequence[int]]=None,
+    ) -> FloatTensor:
         atoms = get_ase_atoms(Ra_star_label, Za)
         Ra_star_model = self._get_Ra_star(params, graph_builder, Ra_star_label, Za, fixed_atom_indices)
 

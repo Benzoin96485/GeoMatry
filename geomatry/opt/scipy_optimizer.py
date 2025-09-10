@@ -22,17 +22,19 @@ class SingleSystemOptimizer:
         fixed_atom_indices: Optional[Sequence[int]]=None,
         device: torch.device=torch.device("cpu"),
         dtype: torch.dtype=torch.float64,
+        max_steps: int=1000,
         fmax: float=1e-4
     ):
         self.Za = Za.to(device, dtype)
         self.graph_builder = graph_builder
         self.fixed_atom_indices = fixed_atom_indices
-        self.fitting = GeometryFitting(ff.to(device, dtype), loss_function, fmax)
+        self.fitting = GeometryFitting(ff.to(device, dtype), loss_function, max_steps, fmax)
         self.device = device
         self.dtype = dtype
         if Ra_star is None:
             if params_star is None:
                 raise ValueError("Either Ra_star or params_star must be provided")
+            print("Obtaining Ra_star from params_star")
             self.Ra_star = self.get_Ra_star(Ra, params_star)
             ase.io.write("Ra_star.xyz", get_ase_atoms(self.Ra_star, self.Za))
         else:
