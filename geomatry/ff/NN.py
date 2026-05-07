@@ -16,14 +16,14 @@ class PairNN(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(1, hidden_dim, dtype=torch.float32),
-            nn.LeakyReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim, dtype=torch.float32),
-            nn.LeakyReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, 1, dtype=torch.float32),
         )
         for layer in self.net:
             if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
 
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
@@ -118,7 +118,8 @@ class NNPotentialFF(baseFF):
 
     def forward_single_pair(self, r: torch.Tensor, Zi: int, Zj: int) -> torch.Tensor:
         key = f"{min(Zi,Zj)}_{max(Zi,Zj)}"
-        return self.nets[key](r)
+        param = next(self.nets[key].parameters())
+        return self.nets[key](r.to(device=param.device, dtype=param.dtype))
 
     def get_E(self, Ra: FloatTensor, Za: IntTensor, idx_i: IntTensor, idx_j: IntTensor, printFlag=False) -> FloatTensor:
         # Gather atom positions and types
@@ -138,7 +139,7 @@ class NNPotentialFF(baseFF):
         # Compute energy pair by pair
         E_pairs = []
         for r, zi, zj in zip(rij, Zi, Zj):
-            if (printFlag): print(r,zi,zj)
+            if (printFlag): print(r, zi, zj)
             E_pairs.append(self.forward_single_pair(r, int(zi), int(zj)))
         E_pairs = torch.stack(E_pairs)
         return E_pairs.sum() / 2  # divide by 2 to avoid double-counting edges

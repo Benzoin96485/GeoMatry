@@ -52,6 +52,131 @@ class SpringFF(baseFF):
         return torch.sum(kij * (rij - r0ij) ** 2 / 2) / 2 # divide by 2 because we have two edges for each pair
 
 
+class LJFF(baseFF):
+    '''
+    Lennard-Jones force field model between different atom types.
+    E = sum_{i<j} 4 * epsilon_{ij} * [ (sigma_{ij} / r_{ij})^12 - (sigma_{ij} / r_{ij})^6 ]
+    '''
+    def __init__(self, max_Za: int):
+        super().__init__(max_Za)
+        self.register_parameter("epsilon", torch.nn.Parameter(torch.ones(max_Za + 1, max_Za + 1)))
+        self.register_parameter("sigma", torch.nn.Parameter(torch.ones(max_Za + 1, max_Za + 1)))
+
+    def reset_parameters(self, epsilon: FloatTensor, sigma: FloatTensor, symmetrize: bool=True) -> None:
+        assert epsilon.shape == (self.max_Za + 1, self.max_Za + 1)
+        assert sigma.shape == (self.max_Za + 1, self.max_Za + 1)
+        if symmetrize:
+            epsilon = (epsilon + epsilon.T) / 2
+            sigma = (sigma + sigma.T) / 2
+        else:
+            assert torch.allclose(epsilon, epsilon.T)
+            assert torch.allclose(sigma, sigma.T)
+        self.epsilon.data = epsilon
+        self.sigma.data = sigma
+
+    def get_E(self, Ra: FloatTensor, Za: IntTensor, idx_i: IntTensor, idx_j: IntTensor) -> FloatTensor:
+        if Ra.device == torch.device("cpu"):
+            Ri = Ra[idx_i]
+            Rj = Ra[idx_j]
+            Zi = Za[idx_i]
+            Zj = Za[idx_j]
+        else:
+            Ri = Ra.gather(0, idx_i.view(-1, 1).expand(-1, 3))
+            Rj = Ra.gather(0, idx_j.view(-1, 1).expand(-1, 3))
+            Zi = Za.gather(0, idx_i)
+            Zj = Za.gather(0, idx_j)
+        rij = pairwise_distance(Ri, Rj)
+        Zij = torch.stack([Zi, Zj], dim=1)
+        epsilonij = gather_nd(self.epsilon, Zij)
+        sigmaij = gather_nd(self.sigma, Zij)
+        inv_r = sigmaij / (rij + 1e-6)
+        inv_r6 = inv_r ** 6
+        inv_r12 = inv_r6 ** 2
+        return torch.sum(4 * (epsilonij ** 2) * (inv_r12 - inv_r6)) / 2
+
+
+class LJsquareFF(baseFF):
+    '''
+    Lennard-Jones force field model with epsilon squared to ensure positive energy.
+    E = sum_{i<j} 4 * (epsilon_{ij})^2 * [ (sigma_{ij} / r_{ij})^12 - (sigma_{ij} / r_{ij})^6 ]
+    '''
+    def __init__(self, max_Za: int):
+        super().__init__(max_Za)
+        self.register_parameter("epsilon", torch.nn.Parameter(torch.ones(max_Za + 1, max_Za + 1)))
+        self.register_parameter("sigma", torch.nn.Parameter(torch.ones(max_Za + 1, max_Za + 1)))
+
+    def reset_parameters(self, epsilon: FloatTensor, sigma: FloatTensor, symmetrize: bool=True) -> None:
+        assert epsilon.shape == (self.max_Za + 1, self.max_Za + 1)
+        assert sigma.shape == (self.max_Za + 1, self.max_Za + 1)
+        if symmetrize:
+            epsilon = (epsilon + epsilon.T) / 2
+            sigma = (sigma + sigma.T) / 2
+        else:
+            assert torch.allclose(epsilon, epsilon.T)
+            assert torch.allclose(sigma, sigma.T)
+        self.epsilon.data = epsilon
+        self.sigma.data = sigma
+
+    def get_E(self, Ra: FloatTensor, Za: IntTensor, idx_i: IntTensor, idx_j: IntTensor) -> FloatTensor:
+        if Ra.device == torch.device("cpu"):
+            Ri = Ra[idx_i]
+            Rj = Ra[idx_j]
+            Zi = Za[idx_i]
+            Zj = Za[idx_j]
+        else:
+            Ri = Ra.gather(0, idx_i.view(-1, 1).expand(-1, 3))
+            Rj = Ra.gather(0, idx_j.view(-1, 1).expand(-1, 3))
+            Zi = Za.gather(0, idx_i)
+            Zj = Za.gather(0, idx_j)
+        rij = pairwise_distance(Ri, Rj)
+        Zij = torch.stack([Zi, Zj], dim=1)
+        epsilonij = gather_nd(self.epsilon, Zij)
+        sigmaij = gather_nd(self.sigma, Zij)
+        inv_r = sigmaij / (rij + 1e-6)
+        inv_r6 = inv_r ** 6
+        inv_r12 = inv_r6 ** 2
+        return torch.sum(4 * (epsilonij ** 2) * (inv_r12 - inv_r6)) / 2
+
+
+def _random_lj_ff_param(max_Za: int, epsilon_range=(0.5, 2.0), sigma_range=(0.9, 1.2)) -> Tuple[FloatTensor, FloatTensor]:
+    epsilon = torch.rand(max_Za + 1, max_Za + 1, dtype=torch.float64) * (epsilon_range[1] - epsilon_range[0]) + epsilon_range[0]
+    epsilon = (epsilon + epsilon.T) / 2
+    sigma = torch.rand(max_Za + 1, max_Za + 1, dtype=torch.float64) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
+    sigma = (sigma + sigma.T) / 2
+    return epsilon, sigma
+
+
+def _random_lj_system(N: int, N_pairs: int, max_Za: int, start_Za: int=0) -> Tuple[FloatTensor, IntTensor, IntTensor, IntTensor]:
+    Ra = torch.randn(N, 3, dtype=torch.float64) * 0.35
+    min_dist = 0.7
+    for i in range(N):
+        for j in range(i):
+            d = torch.norm(Ra[i] - Ra[j])
+            if d < min_dist:
+                Ra[i] += (Ra[i] - Ra[j]) / (d + 1e-6) * (min_dist - d + 0.1)
+    Ra.requires_grad_()
+    Za = torch.randint(start_Za, max_Za + 1, (N,))
+    full_combinations = list(combinations(range(N), 2))
+    edge_index_undirected = torch.tensor(random.sample(full_combinations, min(N_pairs, len(full_combinations))))
+    idx_i = torch.cat([edge_index_undirected[:, 0], edge_index_undirected[:, 1]])
+    idx_j = torch.cat([edge_index_undirected[:, 1], edge_index_undirected[:, 0]])
+    return Ra, Za, idx_i, idx_j
+
+
+def _random_lj_systems(systemN: int, N: int, N_pairs: int, max_Za: int, start_Za: int=0) -> Tuple[FloatTensor, IntTensor, IntTensor, IntTensor]:
+    Ras=[]
+    Zas=[]
+    idx_is=[]
+    idx_js=[]
+    for i in range(systemN):
+        Ra, Za, idx_i, idx_j = _random_lj_system(N, N_pairs, max_Za, start_Za)
+        Ras.append(Ra)
+        Zas.append(Za)
+        idx_is.append(idx_i)
+        idx_js.append(idx_j)
+    return Ras, Zas, idx_is, idx_js
+
+
 def _random_spring_ff_param(max_Za: int, k_max: float=1.0, r0_max: float=1.0) -> Tuple[FloatTensor, FloatTensor]:
     k = torch.rand(max_Za + 1, max_Za + 1, dtype=torch.float64) * k_max # symmetric
     k = (k + k.T) / 2

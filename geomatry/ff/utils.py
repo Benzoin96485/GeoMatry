@@ -29,6 +29,6 @@ def gather_nd(params: Tensor, indices: IntTensor) -> Tensor:
             f'the last dimension of indices must less or equal to the rank of params. Got indices:{indices.shape}, params:{params.shape}. {m} > {n}'
         )
 
-    indices = indices.reshape((num_samples, m)).transpose(0, 1).tolist()
+    indices = tuple(indices.reshape((num_samples, m)).transpose(0, 1))
     output = params[indices]    # (num_samples, ...)
     return output.reshape(out_shape).contiguous()
