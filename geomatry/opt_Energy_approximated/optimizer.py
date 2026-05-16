@@ -14,6 +14,20 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import copy
 
+def validate_lj_geometry(Ra: FloatTensor, min_nearest: float=0.65, max_nearest: float=1.8) -> None:
+    if Ra.shape[0] < 2:
+        return
+    distances = torch.cdist(Ra.detach(), Ra.detach())
+    distances = distances + torch.eye(Ra.shape[0], device=Ra.device, dtype=Ra.dtype) * 1e6
+    nearest = distances.min(dim=1).values
+    min_dist = nearest.min().item()
+    max_dist = nearest.max().item()
+    if min_dist < min_nearest or max_dist > max_nearest:
+        raise ValueError(
+            f"Rejected LJ target geometry: nearest-neighbor distances range "
+            f"from {min_dist:.6f} to {max_dist:.6f}; expected [{min_nearest}, {max_nearest}]."
+        )
+
 def getMaxDirection(optimizer, params_0, index):
     Ra_star_0=optimizer.fitting._get_Ra_star(params_0,optimizer.graph_builders[index],optimizer.Ra_stars[index],optimizer.Zas[index],optimizer.fixed_atom_indices)
     direction=(Ra_star_0-optimizer.Ra_stars[index]).detach().numpy()
@@ -233,6 +247,8 @@ class MultipleSystemOptimizer:
             else:
                 self.Ra_stars=[Ra.to(device, dtype) for Ra in Ras]
             for i, (Ra_star, Za) in enumerate(zip(self.Ra_stars, Zas)):
+                if hasattr(self.ff, 'epsilon') and hasattr(self.ff, 'sigma'):
+                    validate_lj_geometry(Ra_star)
                 ase.io.write(f"Ra_star_{i}.xyz", get_ase_atoms(Ra_star, Za))
         else:
             self.Ra_stars = Ra_stars
@@ -367,7 +383,92 @@ class MultipleSystemOptimizer:
 class DirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
     """Optimizer using directional implicit gradients along the steepest-force direction."""
 
-    def optimize(self, params_0: Dict[str, FloatTensor], epoch, print_period, e_size, eN, sg, lr: float = 1e-3) -> FloatTensor:
+    def _directional_curvature(
+        self,
+        Ra: FloatTensor,
+        Za: IntTensor,
+        graph_builder: GRAPH_BUILDER_TYPE,
+        u: FloatTensor,
+        step: float,
+        n_points: int,
+    ) -> FloatTensor:
+        window = max(3.0 * float(step), 1e-3)
+        n_points = max(7, int(n_points))
+        if n_points % 2 == 0:
+            n_points += 1
+        Ra_base = Ra.detach()
+        u = u.detach()
+        atoms = get_ase_atoms(Ra_base, Za)
+        graph = graph_builder(atoms)
+        with torch.no_grad():
+            alphas = torch.linspace(
+                -window,
+                window,
+                n_points,
+                device=Ra_base.device,
+                dtype=Ra_base.dtype,
+            )
+            energies = torch.stack([
+                self.ff.get_E(Ra_base + alpha * u, Za, *graph)
+                for alpha in alphas
+            ])
+            design = torch.stack([
+                alphas ** 2,
+                alphas,
+                torch.ones_like(alphas),
+            ], dim=1)
+            coeffs = torch.linalg.lstsq(design, energies).solution
+            curvature = 2.0 * coeffs[0]
+        return curvature.detach()
+
+    def _long_range_force_loss(
+        self,
+        R_far_value: float,
+        weight: float,
+    ):
+        if not hasattr(self.ff, "nets"):
+            return None
+
+        first_param = next(self.ff.parameters())
+        longRange_loss = torch.zeros(
+            (),
+            device=first_param.device,
+            dtype=first_param.dtype,
+        )
+
+        for net in self.ff.nets.values():
+            for i in range(10):
+                R_far = torch.tensor(
+                    [R_far_value+i],
+                    device=first_param.device,
+                    dtype=first_param.dtype,
+                    requires_grad=True,
+                )
+                E_far = net(R_far).sum()
+                dE_dR = torch.autograd.grad(
+                    E_far,
+                    R_far,
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                longRange_loss = longRange_loss + dE_dR.pow(2).sum()
+
+        return 0.5 * weight * longRange_loss
+
+    def optimize(
+        self,
+        params_0: Dict[str, FloatTensor],
+        epoch,
+        print_period,
+        e_size,
+        eN,
+        sg,
+        lr: float = 1e-3,
+        longRange: bool = False,
+        longRange_weight: float = 1.0,
+        R_far_value: float = 10.0,
+        batch_size: int = 3,
+    ) -> FloatTensor:
         for key in params_0.keys():
             params_0[key] = params_0[key].requires_grad_(True)
         if 'k' in params_0.keys():
@@ -377,13 +478,18 @@ class DirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
         else:
             self.ff.reset_parameters(params_0)
 
+        batch_size = max(1, int(batch_size))
         optimizer = torch.optim.Adam(list(self.ff.parameters()), lr=lr)
-        for i in tqdm(range(epoch)):
+        pbar = tqdm(range(epoch))
+        for i in pbar:
             optimizer.zero_grad()
-            effective_updates = []
+            effective_longRange = longRange and hasattr(self.ff, "nets")
             total_scale = 0.0
-            for temp in range(3):
-                index = int(torch.randint(0, len(self.Ra_stars), (1,)).item())
+            longRange_loss = None
+            did_directional_update = False
+            batch_indices = torch.randperm(len(self.Ra_stars))[:min(batch_size, len(self.Ra_stars))]
+            for index_tensor in batch_indices:
+                index = int(index_tensor.item())
                 Ra_star = self.Ra_stars[index].clone().requires_grad_(True)
                 E0 = self.ff.get_E(Ra_star, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
                 Fa = self.ff.get_Fa(E0, Ra_star)
@@ -396,8 +502,7 @@ class DirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
 
                 u = Fa.detach() / normFa.detach()
                 g_dir = torch.dot(Fa.view(-1), u.view(-1))
-                Hessian = self.ff.get_Hessian(Fa, Ra_star)
-                H_uu = torch.dot(u.view(-1), torch.mv(Hessian, u.view(-1)))
+                H_uu = self._directional_curvature(Ra_star, self.Zas[index], self.graph_builders[index], u, e_size, eN)
                 if H_uu.abs() < 1e-8:
                     continue
 
@@ -428,8 +533,7 @@ class DirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
                 # Option A: use the original direction u
                 g_dir_eval = torch.dot(Fa_eval.reshape(-1), u.reshape(-1))
                 
-                Hessian = self.ff.get_Hessian(Fa_eval, Ra_eval)
-                H_eval = torch.dot(u.view(-1), torch.mv(Hessian, u.view(-1)))
+                H_eval = self._directional_curvature(Ra_eval, self.Zas[index], self.graph_builders[index], u, e_size, eN)
                 scale = t / H_eval
                 grads = torch.autograd.grad(
                     g_dir_eval,
@@ -444,101 +548,220 @@ class DirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
                     if param.grad is None:
                         param.grad = torch.zeros_like(param)
                     param.grad += -grad * scale
+                did_directional_update = True
 
-            if total_scale == 0.0:
+            if effective_longRange:
+                longRange_loss = self._long_range_force_loss(
+                    R_far_value,
+                    longRange_weight,
+                )
+                if longRange_loss is not None:
+                    grads_far = torch.autograd.grad(
+                        longRange_loss,
+                        self.ff.parameters(),
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+                    for param, grad in zip(self.ff.parameters(), grads_far):
+                        if grad is None:
+                            continue
+                        if param.grad is None:
+                            param.grad = torch.zeros_like(param)
+                        param.grad += grad
+
+            if total_scale == 0.0 and not effective_longRange:
                 break
 
-            optimizer.step()
-            if i % print_period == 0:
-                x = torch.linspace(
-                    -2, 2, 100,
-                    device=Ra_star.device,
-                    dtype=Ra_star.dtype,
+            if longRange_loss is not None:
+                pbar.set_postfix(
+                    longRange_loss=f"{longRange_loss.detach().item():.6e}",
+                    total_scale=f"{total_scale:.6e}",
                 )
-                y = []
-                for a in x:
-                    Ra_test = Ra_star - a * u
+            else:
+                pbar.set_postfix(
+                    total_scale=f"{total_scale:.6e}",
+                )
 
-                    atoms = get_ase_atoms(
-                        Ra_test.detach().cpu(),
-                        self.Zas[index],
+            if i % print_period == 0:
+                if did_directional_update:
+                    x = torch.linspace(
+                        -0.5, 0.5, 50,
+                        device=Ra_star.device,
+                        dtype=Ra_star.dtype,
                     )
+                    y = []
+                    for a in x:
+                        Ra_test = Ra_star - a * u
 
-                    graph = self.graph_builders[index](atoms)
+                        atoms = get_ase_atoms(
+                            Ra_test.detach().cpu(),
+                            self.Zas[index],
+                        )
 
-                    E = self.ff.get_E(
-                        Ra_test,
-                        self.Zas[index],
-                        *graph,
-                    )
+                        graph = self.graph_builders[index](atoms)
 
-                    y.append(E.detach().cpu().item())
-                plt.scatter(x,y)
-                plt.show()
-                print('deviation', t)
-                print(H_uu.item())
-                print('Fratio', torch.norm(Fa_eval).detach().item()/torch.norm(Fa).detach().item())
+                        E = self.ff.get_E(
+                            Ra_test,
+                            self.Zas[index],
+                            *graph,
+                        )
+
+                        y.append(E.detach().cpu().item())
+                    plt.scatter(x,y)
+                    plt.show(block=False)
+                    plt.pause(0.001)
+                    plt.close()
+                    print('deviation', t)
+                    print(H_uu.item())
+                    print('Fratio', g_dir_eval.detach().item()/g_dir.detach().item())
+                if longRange_loss is not None:
+                    print('longRange_loss', longRange_loss.detach().item())
 
                 current_loss = torch.tensor(0.0, dtype=self.dtype, device=self.device)
                 print(f"Iteration {i}, total_scale: {total_scale:.6e}")
-
+            optimizer.step()
         params_0 = copy.deepcopy(self.ff.state_dict())
         return params_0
-
+import math
 class ExactLineSearchDirectionalImplicitMultipleSystemOptimizer(MultipleSystemOptimizer):
     """Optimizer using exact line minimization along the maximum force direction."""
 
-    def _find_line_minimum(self, Ra_star: FloatTensor, Za: IntTensor, graph_builder: GRAPH_BUILDER_TYPE, u: FloatTensor):
+    def _find_line_minimum(
+        self,
+        Ra_star: FloatTensor,
+        Za: IntTensor,
+        graph_builder: GRAPH_BUILDER_TYPE,
+        u: FloatTensor,
+    ):
         atoms = get_ase_atoms(Ra_star, Za)
+        graph = graph_builder(atoms)
 
-        def energy_at_alpha(alpha: float) -> float:
-            Ra_line = Ra_star + alpha * u
-            return float(self.ff.get_E(Ra_line, Za, *graph_builder(atoms)).detach().cpu().item())
+        def projected_force_at_alpha(alpha: float) -> float:
+            Ra_line = (Ra_star + float(alpha) * u).detach().clone().requires_grad_(True)
+            E = self.ff.get_E(Ra_line, Za, *graph)
+            Fa = self.ff.get_Fa(E, Ra_line)
+            F_proj = torch.dot(Fa.view(-1), u.view(-1))
+            return float(F_proj.detach().cpu().item())
 
+        # ------------------------------------------------------------
+        # Cheap Newton-like guess near alpha = 0
+        # ------------------------------------------------------------
         alpha_guess = 0.0
+
         try:
-            E0 = self.ff.get_E(Ra_star, Za, *graph_builder(atoms))
-            Fa = self.ff.get_Fa(E0, Ra_star)
-            Hessian = self.ff.get_Hessian(Fa, Ra_star)
-            force_along_u = float(torch.dot(Fa.view(-1), u.view(-1)).item())
-            H_uu = float(torch.dot(u.view(-1), torch.mv(Hessian, u.view(-1))).item())
-            if H_uu > 1e-8:
-                alpha_guess = max(0.0, force_along_u / H_uu)
+            Ra0 = Ra_star.detach().clone().requires_grad_(True)
+            E0 = self.ff.get_E(Ra0, Za, *graph)
+            Fa0 = self.ff.get_Fa(E0, Ra0)
+            Hessian0 = self.ff.get_Hessian(Fa0, Ra0)
+
+            F0_proj = torch.dot(Fa0.view(-1), u.view(-1))
+            H_uu0 = torch.dot(
+                u.view(-1),
+                torch.mv(Hessian0, u.view(-1)),
+            )
+
+            F0_proj = float(F0_proj.detach().cpu().item())
+            H_uu0 = float(H_uu0.detach().cpu().item())
+
+            if abs(H_uu0) > 1e-8:
+                alpha_guess = F0_proj / H_uu0
+
         except Exception:
             alpha_guess = 0.0
 
-        max_alpha = max(0.3, alpha_guess * 5.0 + 0.3)
-        max_alpha_cap = max(5.0, max_alpha)
-        while max_alpha < max_alpha_cap:
-            mid_alpha = max_alpha / 2.0
-            try:
-                if energy_at_alpha(max_alpha) >= energy_at_alpha(mid_alpha):
-                    break
-            except Exception:
+        # ------------------------------------------------------------
+        # Very cheap local search for nearest F.u = 0
+        # ------------------------------------------------------------
+        base_step = max(1e-3, abs(alpha_guess) + 1e-3)
+        base_step = min(base_step, 1)  # Avoid excessively large steps
+
+        alpha_star = None
+        best_alpha = 0.0
+        best_abs_f = abs(projected_force_at_alpha(0.0))
+
+        for scale in [0.1, 0.4, 1, 4, 10]:
+            step = base_step * scale
+
+            probe_alphas = [
+                -step,
+                -0.5 * step,
+                0.0,
+                0.5 * step,
+                step,
+            ]
+
+            probe_values = []
+
+            for a in probe_alphas:
+                try:
+                    f = projected_force_at_alpha(a)
+                    probe_values.append(f)
+
+                    if abs(f) < best_abs_f:
+                        best_abs_f = abs(f)
+                        best_alpha = a
+
+                except Exception:
+                    probe_values.append(None)
+
+            # Find nearest sign change around alpha = 0
+            candidates = []
+
+            for i in range(len(probe_alphas) - 1):
+                a1 = probe_alphas[i]
+                a2 = probe_alphas[i + 1]
+                f1 = probe_values[i]
+                f2 = probe_values[i + 1]
+
+                if f1 is None or f2 is None:
+                    continue
+
+                if f1 == 0.0:
+                    candidates.append(a1)
+
+                elif f1 * f2 < 0:
+                    # Linear interpolation root estimate
+                    alpha_root = a1 - f1 * (a2 - a1) / (f2 - f1)
+                    candidates.append(alpha_root)
+
+            if candidates:
+                alpha_star = min(candidates, key=lambda a: abs(a))
                 break
-            max_alpha = min(max_alpha * 2.0, max_alpha_cap)
 
-        result = minimize_scalar(
-            energy_at_alpha,
-            bounds=(0.0, max_alpha),
-            method='bounded',
-            options={'xatol': 1e-3, 'maxiter': 50}
-        )
+        # If no sign change was found, use the best nearby point
+        if alpha_star is None:
+            alpha_star = best_alpha
 
-        if result.success:
-            alpha_star = float(result.x)
-        else:
-            alpha_star = alpha_guess
+        # ------------------------------------------------------------
+        # Evaluate final geometry and curvature
+        # ------------------------------------------------------------
+        Ra_min = (Ra_star + alpha_star * u).detach().clone().requires_grad_(True)
 
-        Ra_min = Ra_star + alpha_star * u
-        E_min = self.ff.get_E(Ra_min, Za, *graph_builder(atoms))
+        E_min = self.ff.get_E(Ra_min, Za, *graph)
         Fa_min = self.ff.get_Fa(E_min, Ra_min)
         Hessian_min = self.ff.get_Hessian(Fa_min, Ra_min)
-        H_uu_min = torch.dot(u.view(-1), torch.mv(Hessian_min, u.view(-1)))
+
+        H_uu_min = torch.dot(
+            u.view(-1),
+            torch.mv(Hessian_min, u.view(-1)),
+        )
 
         return alpha_star, Ra_min.detach(), H_uu_min
-
-    def optimize(self, params_0: Dict[str, FloatTensor], epoch, print_period, e_size, eN, sg, lr: float = 1e-3) -> FloatTensor:
+    def optimize(
+        self,
+        params_0: Dict[str, FloatTensor],
+        epoch,
+        print_period,
+        e_size,
+        eN,
+        sg,
+        lr: float = 1e-3,
+        longRange: bool = False,
+        longRange_weight: float = 1.0,
+        R_far_value: float = 10.0,
+        batch_size: int = 4,
+    ) -> FloatTensor:
         for key in params_0.keys():
             params_0[key] = params_0[key].requires_grad_(True)
         if 'k' in params_0.keys():
@@ -552,49 +775,112 @@ class ExactLineSearchDirectionalImplicitMultipleSystemOptimizer(MultipleSystemOp
         pbar = tqdm(range(epoch))
         for i in pbar:
             optimizer.zero_grad()
+            effective_longRange = longRange and hasattr(self.ff, "nets")
             total_scale = 0.0
             alpha_star = 0.0
-            for temp in range(min(2, len(self.Ra_stars))):
-                index = int(torch.randint(0, len(self.Ra_stars), (1,)).item())
-                Ra_star = self.Ra_stars[index].clone().requires_grad_(True)
-                E0 = self.ff.get_E(Ra_star, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
-                Fa = self.ff.get_Fa(E0, Ra_star)
-                if self.fixed_atom_indices is not None:
-                    Fa[self.fixed_atom_indices, :] = 0
+            index = int(torch.randint(0, len(self.Ra_stars), (1,)).item())
+            Ra_star = self.Ra_stars[index].clone().requires_grad_(True)
+            E0 = self.ff.get_E(Ra_star, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
+            Fa = self.ff.get_Fa(E0, Ra_star)
+            if self.fixed_atom_indices is not None:
+                Fa[self.fixed_atom_indices, :] = 0
 
-                normFa = torch.norm(Fa)
-                if normFa < 1e-8:
-                    continue
+            normFa = torch.norm(Fa)
+            if normFa < 1e-8:
+                break
 
-                u = Fa.detach() / normFa.detach()
-                alpha_star, Ra_min, H_uu_min = self._find_line_minimum(
-                    Ra_star, self.Zas[index], self.graph_builders[index], u
+            u = Fa.detach() / normFa.detach()
+            if not effective_longRange:
+                batch_indices = torch.randperm(len(self.Ra_stars))[:min(batch_size, len(self.Ra_stars))]
+                for index_tensor in batch_indices:
+                    index = int(index_tensor.item())
+                    Ra_star = self.Ra_stars[index].clone().requires_grad_(True)
+                    E0 = self.ff.get_E(Ra_star, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
+                    Fa = self.ff.get_Fa(E0, Ra_star)
+                    if self.fixed_atom_indices is not None:
+                        Fa[self.fixed_atom_indices, :] = 0
+
+                    normFa = torch.norm(Fa)
+                    if normFa < 1e-8:
+                        continue
+
+                    u = Fa.detach() / normFa.detach()
+                    alpha_star, Ra_min, H_uu_min = self._find_line_minimum(
+                        Ra_star, self.Zas[index], self.graph_builders[index], u
+                    )
+                    if H_uu_min.abs() < 1e-8:
+                        continue
+
+                    Ra_min = Ra_min.detach().requires_grad_(True)
+                    E_min = self.ff.get_E(Ra_min, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
+                    Fa_min = self.ff.get_Fa(E_min, Ra_min)
+                    g_dir = torch.dot(Fa_min.view(-1), u.view(-1))
+                    scale = alpha_star / H_uu_min
+                    total_scale += scale.abs().item()
+
+                    grads = torch.autograd.grad(g_dir, self.ff.parameters(), retain_graph=False, create_graph=False, allow_unused=True)
+                    for param, grad in zip(self.ff.parameters(), grads):
+                        if grad is None:
+                            continue
+                        if param.grad is None:
+                            param.grad = torch.zeros_like(param)
+                        param.grad += grad * scale
+                if total_scale == 0.0:
+                    break
+
+            longRange_loss = None
+            if effective_longRange:
+                first_param = next(self.ff.parameters())
+                longRange_loss = torch.zeros(
+                    (),
+                    device=first_param.device,
+                    dtype=first_param.dtype,
                 )
-                if H_uu_min.abs() < 1e-8:
-                    continue
 
-                Ra_min = Ra_min.detach().requires_grad_(True)
-                E_min = self.ff.get_E(Ra_min, self.Zas[index], *self.graph_builders[index](get_ase_atoms(self.Ra_stars[index], self.Zas[index])))
-                Fa_min = self.ff.get_Fa(E_min, Ra_min)
-                g_dir = torch.dot(Fa_min.view(-1), u.view(-1))
-                scale = alpha_star / H_uu_min
-                total_scale += scale.abs().item()
+                for net in self.ff.nets.values():
+                    R_far = torch.tensor(
+                        [R_far_value],
+                        device=first_param.device,
+                        dtype=first_param.dtype,
+                        requires_grad=True,
+                    )
+                    E_far = net(R_far).sum()
 
-                grads = torch.autograd.grad(g_dir, self.ff.parameters(), retain_graph=False, create_graph=False, allow_unused=True)
-                for param, grad in zip(self.ff.parameters(), grads):
+                    dE_dR = torch.autograd.grad(
+                        E_far,
+                        R_far,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    longRange_loss = longRange_loss + dE_dR.pow(2).sum()
+
+                longRange_loss = 0.5 * longRange_weight * longRange_loss
+
+                grads_far = torch.autograd.grad(
+                    longRange_loss,
+                    self.ff.parameters(),
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+                for param, grad in zip(self.ff.parameters(), grads_far):
                     if grad is None:
                         continue
                     if param.grad is None:
                         param.grad = torch.zeros_like(param)
-                    param.grad += grad * scale
+                    param.grad += grad * longRange_weight
 
-            if total_scale == 0.0:
-                break
 
             optimizer.step()
             min_epsilon = float(self.ff.epsilon.min()) if hasattr(self.ff, 'epsilon') else None
-            pbar.set_postfix(alpha_star=f"{alpha_star:.4e}", total_scale=f"{total_scale:.6e}", min_epsilon=f"{min_epsilon:.4e}" if min_epsilon is not None else "N/A")
+            if not effective_longRange:
+                pbar.set_postfix(alpha_star=f"{alpha_star:.4e}", total_scale=f"{total_scale:.6e}", min_epsilon=f"{min_epsilon:.4e}" if min_epsilon is not None else "N/A")
+            elif longRange_loss is not None:
+                pbar.set_postfix(longRange_loss=f"{longRange_loss.detach().item():.6e}", min_epsilon=f"{min_epsilon:.4e}" if min_epsilon is not None else "N/A")
             if i % print_period == 0:
+                if effective_longRange and longRange_loss is not None:
+                    print(longRange_loss.item())
                 x = torch.linspace(
                     -2, 2, 100,
                     device=Ra_star.device,
@@ -619,7 +905,12 @@ class ExactLineSearchDirectionalImplicitMultipleSystemOptimizer(MultipleSystemOp
 
                     y.append(E.detach().cpu().item())
                 plt.scatter(x,y)
-                plt.show()
+                ymin=min(y)-1
+                ymax=min(max(y),ymin+10)
+                plt.ylim([ymin,ymax])
+                plt.show(block=False)
+                plt.pause(0.001)
+                plt.close()
                 print(alpha_star)
 
 

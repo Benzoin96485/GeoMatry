@@ -147,17 +147,37 @@ def _random_lj_ff_param(max_Za: int, epsilon_range=(0.5, 2.0), sigma_range=(0.9,
 
 
 def _random_lj_system(N: int, N_pairs: int, max_Za: int, start_Za: int=0) -> Tuple[FloatTensor, IntTensor, IntTensor, IntTensor]:
-    Ra = torch.randn(N, 3, dtype=torch.float64) * 0.35
     min_dist = 0.7
-    for i in range(N):
-        for j in range(i):
-            d = torch.norm(Ra[i] - Ra[j])
-            if d < min_dist:
-                Ra[i] += (Ra[i] - Ra[j]) / (d + 1e-6) * (min_dist - d + 0.1)
+    neighbor_dist_range = (0.9, 1.15)
+    Ra = torch.zeros(N, 3, dtype=torch.float64)
+    for i in range(1, N):
+        for _ in range(200):
+            parent = random.randrange(i)
+            direction = torch.randn(3, dtype=torch.float64)
+            direction = direction / (torch.norm(direction) + 1e-12)
+            distance = random.uniform(*neighbor_dist_range)
+            candidate = Ra[parent] + distance * direction
+            if torch.all(torch.norm(Ra[:i] - candidate, dim=1) >= min_dist):
+                Ra[i] = candidate
+                break
+        else:
+            # Fallback keeps the atom attached to an existing neighbor even in a crowded cluster.
+            parent = random.randrange(i)
+            direction = torch.randn(3, dtype=torch.float64)
+            direction = direction / (torch.norm(direction) + 1e-12)
+            Ra[i] = Ra[parent] + neighbor_dist_range[1] * direction
+
+    Ra = Ra - Ra.mean(dim=0, keepdim=True)
     Ra.requires_grad_()
     Za = torch.randint(start_Za, max_Za + 1, (N,))
     full_combinations = list(combinations(range(N), 2))
-    edge_index_undirected = torch.tensor(random.sample(full_combinations, min(N_pairs, len(full_combinations))))
+    if N < 2:
+        empty_index = torch.empty(0, dtype=torch.long)
+        return Ra, Za, empty_index, empty_index
+
+    # LJ examples should behave like physical all-pair clusters. Sparse LJ graphs can
+    # let non-interacting atom pairs collapse onto each other during optimization.
+    edge_index_undirected = torch.tensor(full_combinations, dtype=torch.long)
     idx_i = torch.cat([edge_index_undirected[:, 0], edge_index_undirected[:, 1]])
     idx_j = torch.cat([edge_index_undirected[:, 1], edge_index_undirected[:, 0]])
     return Ra, Za, idx_i, idx_j
